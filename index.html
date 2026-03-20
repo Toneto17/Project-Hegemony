@@ -2622,6 +2622,25 @@ function renderActionButtons(){
       </div>`;
     return;
   }
+  // Multiplayer: show waiting panel when it's the opponent's turn
+  if(G.mpLocalPlayer !== null && G.mpLocalPlayer !== G.currentPlayer){
+    const opName = cp.name || 'Opponent';
+    el.innerHTML=`
+      <div style="text-align:center;padding:16px 6px 8px">
+        <div style="font-family:Cinzel,serif;font-size:9px;letter-spacing:3px;color:#e8a838;margin-bottom:10px;text-transform:uppercase">⏳ Opponent's Turn</div>
+        <div style="background:rgba(232,168,56,0.06);border:1px solid rgba(232,168,56,0.2);border-radius:4px;padding:12px;margin-bottom:10px">
+          <div style="font-size:13px;color:${cp.color};margin-bottom:6px"><b>${opName}</b> is playing…</div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">
+            <span style="color:var(--text-dim)">Turn</span><span>${G.turn}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:11px">
+            <span style="color:var(--text-dim)">Phase</span><span>${G.phase===1?'Harvest':G.phase===2?'Upkeep':'Actions'}</span>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);font-style:italic">Wait for your turn…</div>
+      </div>`;
+    return;
+  }
   if(G.phase===1) renderPhase1Buttons(el,cp);
   else if(G.phase===2) renderPhase2Buttons(el,cp);
   else if(G.phase===3) renderPhase3Buttons(el,cp);
@@ -2795,6 +2814,7 @@ function setMode(m){
 // PHASE 1: PRODUCTION
 // ============================================================
 function doPhase1(){
+  if(!isMyTurn()) return;
   // Show rolling animation first
   openModal(`
     <h2>🎲 HARVEST PHASE</h2>
@@ -2974,6 +2994,7 @@ function finishProduction(){
 // PHASE 2: MAINTENANCE
 // ============================================================
 function payMaintenance(){
+  if(!isMyTurn()) return;
   const cp=G.players[G.currentPlayer];
   const armies=countArmies(cp.id);
   const divisor=cp.upgrades.upg_supply?4:3;
@@ -2986,6 +3007,7 @@ function payMaintenance(){
 }
 
 function disbandForMaintenance(){
+  if(!isMyTurn()) return;
   const cp=G.players[G.currentPlayer];
   const pid=cp.id;
   const divisor=cp.upgrades.upg_supply?4:3;
@@ -3079,10 +3101,17 @@ function resetIdleTimer(){
     }, 20000);
   }
 }
+// ── Multiplayer turn guard ───────────────────────────────────
+function isMyTurn(){
+  // null = local game (hotseat/AI), always allow; otherwise check player index
+  return G.mpLocalPlayer === null || G.mpLocalPlayer === G.currentPlayer;
+}
+
 // ── PHASE 3: ACTIONS ─────────────────────────────────────────
 function handleMapClick(e){
   if(G.phase!==3||G.gameOver)return;
-  if(G.aiTurn||G.players[G.currentPlayer]?.isAI)return; // block during AI turn
+  if(G.aiTurn||G.players[G.currentPlayer]?.isAI)return;
+  if(!isMyTurn()) return; // multiplayer: block if not your turn
   resetIdleTimer();
   const rect=canvas.getBoundingClientRect();
   const mx=e.clientX-rect.left, my=e.clientY-rect.top;
@@ -3218,6 +3247,7 @@ function exitToMenu(){
 }
 
 function endPhase3(){
+  if(!isMyTurn()) return;
   clearTimeout(_idleTimer);
   const btn=document.getElementById('endTurnBtn');
   if(btn) btn.classList.remove('idle-nudge');
@@ -3462,6 +3492,11 @@ function showHandoff(player){
 
   requestAnimationFrame(()=>{ el.classList.add('show'); });
   SFX.playBuild && SFX.playBuild();
+
+  // In multiplayer, auto-dismiss if it's not our turn (opponent's handoff)
+  if(G.mpLocalPlayer !== null && G.mpLocalPlayer !== G.currentPlayer){
+    setTimeout(dismissHandoff, 1200);
+  }
 }
 
 function dismissHandoff(){
@@ -4554,7 +4589,7 @@ function startGame(n, mode='hotseat', diff='normal', mapType='classic', mapSeed=
   }
   G.phase=1; G.currentPlayer=0; G.turn=1;
   G.flashHexes={}; G.aiTurn=false; G._lastElimBounty=null; G.gameOver=false; G.winner=null;
-  G.movesUsed=0;
+  G.movesUsed=0; G.mpLocalPlayer=null;
   closeModal();
   drawGame(); updateUI();
   addLog('Game started! Good luck!','important');
@@ -5724,6 +5759,7 @@ const MP = (function(){
   let guestConns = [];          // host → guest connections
   let roomCode = null;
   let isHost = false;
+  let localPlayerId = null;     // which player index this client controls (0=host, 1+=guest)
   let players = [];
   let chatMessages = [];
   let status = 'idle';          // idle | opening | ready | connecting | connected | error
@@ -5739,6 +5775,7 @@ const MP = (function(){
     const code = generateCode();
     roomCode = code;
     isHost = true;
+    localPlayerId = 0;
     status = 'opening';
     renderMultiplayer();
     const acc = AUTH.getSession();
@@ -5817,8 +5854,13 @@ const MP = (function(){
           const id = players.length;
           players.push({name: msg.name, id, isHost: false});
           broadcast({type:'playerList', players});
+          // Tell this specific guest their assigned player ID
+          if(from && from.open) from.send({type:'assignId', id});
           renderMultiplayer();
         }
+        break;
+      case 'assignId':
+        if(!isHost){ localPlayerId = msg.id; }
         break;
       case 'playerList':
         if(!isHost){ players = msg.players; renderMultiplayer(); }
@@ -5877,13 +5919,13 @@ const MP = (function(){
     for(const c of guestConns){ try{ c.close(); } catch(e){} }
     guestConns = [];
     if(peer){ try{ peer.destroy(); } catch(e){} peer = null; }
-    roomCode = null; isHost = false; players = []; chatMessages = [];
+    roomCode = null; isHost = false; localPlayerId = null; players = []; chatMessages = [];
     status = 'idle';
   }
 
   function getState(){
     const connCount = isHost ? guestConns.filter(c=>c.open).length : (hostConn&&hostConn.open ? 1 : 0);
-    return {roomCode, isHost, players, chatMessages, status, connCount};
+    return {roomCode, isHost, localPlayerId, players, chatMessages, status, connCount};
   }
 
   return { createRoom, joinRoom, sendChat, broadcastState, startHostGame, leave, getState };
@@ -5895,7 +5937,7 @@ function startMultiplayerGame(state){
   closeModal();
   homeMapType = state.mapType || 'classic';
   homeSelectedPlayers = state.numPlayers;
-  homeGameMode = 'hotseat'; // multiplayer uses hotseat with sync
+  homeGameMode = 'hotseat';
   homeMapSeed = state.seed || '';
 
   const hp = document.getElementById('homepage');
@@ -5903,6 +5945,9 @@ function startMultiplayerGame(state){
 
   setTimeout(()=>{
     startGame(state.numPlayers, 'hotseat', 'normal', state.mapType, state.seed, state.playerNames || []);
+    // Set local player ID for multiplayer turn enforcement
+    const mpState = MP.getState();
+    G.mpLocalPlayer = mpState.localPlayerId != null ? mpState.localPlayerId : null;
     hp.style.transition = 'opacity 0.5s ease';
     hp.style.opacity = '0';
     setTimeout(()=>{
